@@ -18,7 +18,7 @@ import (
 	"testing"
 	"time"
 
-	http "github.com/Danny-Dasilva/fhttp"
+	http "github.com/FastTLS/fhttp"
 )
 
 type eofReader struct{}

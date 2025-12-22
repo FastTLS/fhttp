@@ -1,4 +1,4 @@
-module github.com/Danny-Dasilva/fhttp
+module github.com/FastTLS/fhttp
 
 go 1.16
 

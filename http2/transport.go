@@ -29,10 +29,10 @@ import (
 
 	tls "github.com/refraction-networking/utls"
 
-	http "github.com/Danny-Dasilva/fhttp"
-	"github.com/Danny-Dasilva/fhttp/httptrace"
+	http "github.com/FastTLS/fhttp"
+	"github.com/FastTLS/fhttp/httptrace"
 
-	"github.com/Danny-Dasilva/fhttp/http2/hpack"
+	"github.com/FastTLS/fhttp/http2/hpack"
 	"golang.org/x/net/http/httpguts"
 	"golang.org/x/net/idna"
 )
