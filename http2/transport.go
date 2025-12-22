@@ -163,11 +163,6 @@ type Transport struct {
 	Navigator string
 }
 
-var (
-	Chrome  = "chrome"
-	Firefox = "firefox"
-)
-
 func (t *Transport) maxHeaderListSize() uint32 {
 	if t.MaxHeaderListSize == 0 {
 		return 10 << 20
@@ -726,8 +721,13 @@ func (t *Transport) newClientConn(c net.Conn, addr string, singleUse bool) (*Cli
 		t.vlogf("http2: Transport creating client conn %p to %v", cc, c.RemoteAddr())
 	}
 
-	t.AutoUpdate()
-	t.ApplyPreset()
+	// 设置默认的 golang 配置（如果未设置）
+	if t.HeaderTableSize == 0 {
+		t.HeaderTableSize = initialHeaderTableSize
+	}
+	if t.InitialWindowSize == 0 {
+		t.InitialWindowSize = initialWindowSize
+	}
 
 	cc.cond = sync.NewCond(&cc.mu)
 	cc.flow.add(int32(t.InitialWindowSize))
@@ -757,15 +757,6 @@ func (t *Transport) newClientConn(c net.Conn, addr string, singleUse bool) (*Cli
 	cc.bw.Write(clientPreface)
 
 	if t.HTTP2Settings != nil {
-		inflowValue, nextStreamId, err := cc.fr.AutoWriteFrames(t)
-		if err != nil {
-			return nil, err
-		}
-
-		cc.inflow.add(int32(inflowValue))
-		cc.nextStreamID = nextStreamId
-
-	} else if t.Navigator != "" {
 		inflowValue, nextStreamId, err := cc.fr.AutoWriteFrames(t)
 		if err != nil {
 			return nil, err
@@ -824,109 +815,65 @@ func (t *Transport) newClientConn(c net.Conn, addr string, singleUse bool) (*Cli
 	return cc, nil
 }
 
-func (t *Transport) AutoUpdate() {
-	switch t.Navigator {
-	case Firefox:
-		t.HeaderTableSize = 65536
-
-	case Chrome:
-		t.HeaderTableSize = 65536
-		t.MaxHeaderListSize = 262144
-
-	default:
-		t.HeaderTableSize = initialHeaderTableSize
-		t.InitialWindowSize = initialWindowSize
-	}
-}
-
-func (t *Transport) ApplyPreset() {
-	switch t.Navigator {
-	case Firefox:
-		t.Settings = []Setting{
-			{ID: SettingHeaderTableSize, Val: 65536},
-			{ID: SettingInitialWindowSize, Val: 131072},
-			{ID: SettingMaxFrameSize, Val: 16384},
-		}
-	case Chrome:
-		t.Settings = []Setting{
-			{ID: SettingHeaderTableSize, Val: 65536},
-			{ID: SettingMaxConcurrentStreams, Val: 1000},
-			{ID: SettingInitialWindowSize, Val: 6291456},
-			{ID: SettingMaxFrameSize, Val: 16384},
-			{ID: SettingMaxHeaderListSize, Val: 262144},
-		}
-	}
-}
+// AutoUpdate 和 ApplyPreset 已移除
+// 现在使用默认的 golang 配置，可以通过 HTTP2Settings 覆盖
 
 func (fr *Framer) AutoWriteFrames(t *Transport) (inflowValue uint32, nextStreamId uint32, err error) {
-	if t.HTTP2Settings != nil {
-		if t.HTTP2Settings.Settings != nil {
-			t.Settings = t.HTTP2Settings.Settings
-			for _, setting := range t.Settings {
-				if setting.ID == SettingInitialWindowSize {
-					inflowValue = setting.Val
-				}
+	if t.HTTP2Settings == nil {
+		return 0, 0, errors.New("HTTP2Settings is required when using AutoWriteFrames")
+	}
+
+	// 使用 HTTP2Settings 中的配置
+	if t.HTTP2Settings.Settings != nil {
+		t.Settings = t.HTTP2Settings.Settings
+		// 从 Settings 中查找 InitialWindowSize
+		for _, setting := range t.Settings {
+			if setting.ID == SettingInitialWindowSize {
+				inflowValue = setting.Val
 			}
-		} else if t.Navigator == Firefox {
-			inflowValue = 131072
-		} else if t.Navigator == Chrome {
-			inflowValue = 6291456
-		} else {
-			return 0, 0, errors.New(t.Navigator + " is not supported")
+		}
+		// 如果 Settings 中没有 InitialWindowSize，使用默认值
+		if inflowValue == 0 {
+			inflowValue = initialWindowSize
 		}
 		fr.WriteSettings(t.Settings...)
-		var connectionFlow = uint32(0)
-		if t.HTTP2Settings.ConnectionFlow != 0 {
-			connectionFlow = uint32(t.HTTP2Settings.ConnectionFlow)
-		} else if t.Navigator == Firefox {
-			connectionFlow = uint32(12517377)
-		} else if t.Navigator == Chrome {
-			connectionFlow = uint32(15663105)
-		} else {
-			return 0, 0, errors.New(t.Navigator + " is not supported")
-		}
-		fr.WriteWindowUpdate(0, connectionFlow)
-		if t.HTTP2Settings.PriorityFrames != nil {
-			for _, frame := range t.HTTP2Settings.PriorityFrames {
-				fr.WritePriority(frame.StreamID, frame.PriorityParam)
-				nextStreamId = frame.StreamID + uint32(2)
-			}
-		} else if t.Navigator == Firefox {
-			fr.WritePriority(3, PriorityParam{Weight: 200})
-			fr.WritePriority(5, PriorityParam{Weight: 100})
-			fr.WritePriority(7, PriorityParam{Weight: 0})
-			fr.WritePriority(9, PriorityParam{Weight: 0, StreamDep: 7})
-			fr.WritePriority(11, PriorityParam{Weight: 0, StreamDep: 3})
-			fr.WritePriority(13, PriorityParam{Weight: 240})
-			nextStreamId = uint32(15)
-		} else if t.Navigator == Chrome {
-			nextStreamId = uint32(1)
-		} else {
-			return 0, 0, errors.New(t.Navigator + " is not supported")
-		}
-		return inflowValue + connectionFlow, nextStreamId, nil
 	} else {
-		switch t.Navigator {
-		case Firefox:
-			fr.WriteSettings(t.Settings...)
-			fr.WriteWindowUpdate(0, 12517377)
-			fr.WritePriority(3, PriorityParam{Weight: 200})
-			fr.WritePriority(5, PriorityParam{Weight: 100})
-			fr.WritePriority(7, PriorityParam{Weight: 0})
-			fr.WritePriority(9, PriorityParam{Weight: 0, StreamDep: 7})
-			fr.WritePriority(11, PriorityParam{Weight: 0, StreamDep: 3})
-			fr.WritePriority(13, PriorityParam{Weight: 240})
-			return 131072 + 12517377, 15, nil
-
-		case Chrome:
-			fr.WriteSettings(t.Settings...)
-			fr.WriteWindowUpdate(0, 15663105)
-			return 6291456 + 15663105, 1, nil
-
-		default:
-			return 0, 0, errors.New(t.Navigator + " is not supported")
+		// 如果没有设置 Settings，使用默认的 golang 配置
+		inflowValue = initialWindowSize
+		// 写入默认的 Settings
+		var pushEnabled uint32
+		if t.PushHandler != nil {
+			pushEnabled = 1
 		}
+		fr.WriteSettings(
+			Setting{ID: SettingEnablePush, Val: pushEnabled},
+			Setting{ID: SettingInitialWindowSize, Val: initialWindowSize},
+			Setting{ID: SettingHeaderTableSize, Val: initialHeaderTableSize},
+		)
 	}
+
+	// 设置连接级别的流控窗口
+	var connectionFlow = uint32(0)
+	if t.HTTP2Settings.ConnectionFlow != 0 {
+		connectionFlow = uint32(t.HTTP2Settings.ConnectionFlow)
+	} else {
+		// 使用默认的 golang 连接流控
+		connectionFlow = transportDefaultConnFlow
+	}
+	fr.WriteWindowUpdate(0, connectionFlow)
+
+	// 写入 Priority 帧
+	if t.HTTP2Settings.PriorityFrames != nil {
+		for _, frame := range t.HTTP2Settings.PriorityFrames {
+			fr.WritePriority(frame.StreamID, frame.PriorityParam)
+			nextStreamId = frame.StreamID + uint32(2)
+		}
+	} else {
+		// 如果没有设置 PriorityFrames，使用默认的 nextStreamID
+		nextStreamId = uint32(1)
+	}
+
+	return inflowValue + connectionFlow, nextStreamId, nil
 }
 
 func (cc *ClientConn) healthCheck() {
