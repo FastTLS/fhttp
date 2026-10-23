@@ -7,6 +7,7 @@
 package http2
 
 import (
+	"context"
 	"sync"
 
 	tls "github.com/refraction-networking/utls"
@@ -80,7 +81,7 @@ func (p *clientConnPool) getClientConn(req *http.Request, addr string, dialOnMis
 		// It gets its own connection.
 		traceGetConn(req, addr)
 		const singleUse = true
-		cc, err := p.t.dialClientConn(addr, singleUse)
+		cc, err := p.t.dialClientConnContext(req.Context(), addr, singleUse)
 		if err != nil {
 			return nil, err
 		}
@@ -102,18 +103,37 @@ func (p *clientConnPool) getClientConn(req *http.Request, addr string, dialOnMis
 	}
 	traceGetConn(req, addr)
 	call := p.getStartDialLocked(addr)
+	call.waiters++
 	p.mu.Unlock()
-	<-call.done
-	return call.res, call.err
+	defer func() {
+		p.mu.Lock()
+		call.waiters--
+		if call.waiters == 0 {
+			call.cancel()
+			if p.dialing[addr] == call {
+				delete(p.dialing, addr)
+			}
+		}
+		p.mu.Unlock()
+	}()
+	select {
+	case <-call.done:
+		return call.res, call.err
+	case <-req.Context().Done():
+		return nil, req.Context().Err()
+	}
 }
 
 // dialCall is an in-flight Transport dial call to a host.
 type dialCall struct {
-	_    incomparable
-	p    *clientConnPool
-	done chan struct{} // closed when done
-	res  *ClientConn   // valid after done is closed
-	err  error         // valid after done is closed
+	ctx     context.Context
+	cancel  context.CancelFunc
+	waiters int // protected by p.mu
+	_       incomparable
+	p       *clientConnPool
+	done    chan struct{} // closed when done
+	res     *ClientConn   // valid after done is closed
+	err     error         // valid after done is closed
 }
 
 // requires p.mu is held.
@@ -122,7 +142,8 @@ func (p *clientConnPool) getStartDialLocked(addr string) *dialCall {
 		// A dial is already in-flight. Don't start another.
 		return call
 	}
-	call := &dialCall{p: p, done: make(chan struct{})}
+	ctx, cancel := context.WithCancel(context.Background())
+	call := &dialCall{p: p, done: make(chan struct{}), ctx: ctx, cancel: cancel}
 	if p.dialing == nil {
 		p.dialing = make(map[string]*dialCall)
 	}
@@ -134,14 +155,20 @@ func (p *clientConnPool) getStartDialLocked(addr string) *dialCall {
 // run in its own goroutine.
 func (c *dialCall) dial(addr string) {
 	const singleUse = false // shared conn
-	c.res, c.err = c.p.t.dialClientConn(addr, singleUse)
-	close(c.done)
+	c.res, c.err = c.p.t.dialClientConnContext(c.ctx, addr, singleUse)
 
 	c.p.mu.Lock()
-	delete(c.p.dialing, addr)
-	if c.err == nil {
-		c.p.addConnLocked(addr, c.res)
+	if c.p.dialing[addr] == c {
+		delete(c.p.dialing, addr)
 	}
+	if c.err == nil && c.waiters > 0 {
+		c.p.addConnLocked(addr, c.res)
+	} else if c.err == nil {
+		c.res.Close()
+		c.err = context.Canceled
+	}
+	close(c.done)
+	c.cancel()
 	c.p.mu.Unlock()
 }
 

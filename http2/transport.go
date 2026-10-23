@@ -69,6 +69,10 @@ type HTTP2Settings struct {
 // A Transport internally caches connections to servers. It is safe
 // for concurrent use by multiple goroutines.
 type Transport struct {
+	// DialTLSContext takes precedence over DialTLS and observes pooled dial cancellation.
+	DialTLSContext func(context.Context, string, string, *tls.Config) (net.Conn, error)
+	// IdleConnTimeout bounds idle connections when used without an HTTP/1 transport.
+	IdleConnTimeout time.Duration
 	// DialTLS specifies an optional dial function for creating
 	// TLS connections for requests.
 	//
@@ -628,11 +632,20 @@ func canRetryError(err error) bool {
 }
 
 func (t *Transport) dialClientConn(addr string, singleUse bool) (*ClientConn, error) {
+	return t.dialClientConnContext(context.Background(), addr, singleUse)
+}
+
+func (t *Transport) dialClientConnContext(ctx context.Context, addr string, singleUse bool) (*ClientConn, error) {
 	host, _, err := net.SplitHostPort(addr)
 	if err != nil {
 		return nil, err
 	}
-	tconn, err := t.dialTLS()("tcp", addr, t.newTLSConfig(host))
+	var tconn net.Conn
+	if t.DialTLSContext != nil {
+		tconn, err = t.DialTLSContext(ctx, "tcp", addr, t.newTLSConfig(host))
+	} else {
+		tconn, err = t.dialTLS()("tcp", addr, t.newTLSConfig(host))
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -3049,7 +3062,7 @@ func (t *Transport) idleConnTimeout() time.Duration {
 	if t.t1 != nil {
 		return t.t1.IdleConnTimeout
 	}
-	return 0
+	return t.IdleConnTimeout
 }
 
 func traceGetConn(req *http.Request, hostPort string) {
