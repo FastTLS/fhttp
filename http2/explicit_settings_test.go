@@ -15,7 +15,7 @@ func TestExplicitZeroDoesNotSelectNavigatorDefaults(t *testing.T) {
 	}
 	// One SETTINGS frame, no WINDOW_UPDATE or Firefox PRIORITY frames.
 	want, _ := hex.DecodeString("000006040000000000000400000000")
-	if !bytes.Equal(b.Bytes(), want) || flow != 0 || next != 1 {
+	if !bytes.Equal(b.Bytes(), want) || flow != initialWindowSize || next != 1 {
 		t.Fatalf("explicit zero replaced: %x flow=%d next=%d", b.Bytes(), flow, next)
 	}
 }

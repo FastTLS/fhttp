@@ -292,25 +292,27 @@ type ClientConn struct {
 	idleTimeout time.Duration // or 0 for never
 	idleTimer   *time.Timer
 
-	mu               sync.Mutex // guards following
-	cond             *sync.Cond // hold mu; broadcast on flow/closed changes
-	flow             flow       // our conn-level flow control quota (cs.flow is per stream)
-	inflow           flow       // peer's conn-level flow control
-	closing          bool
-	closed           bool
-	wantSettingsAck  bool                     // we sent a SETTINGS frame and haven't heard back
-	goAway           *GoAwayFrame             // if non-nil, the GoAwayFrame we received
-	goAwayDebug      string                   // goAway frame's debug data, retained as a string
-	streams          map[uint32]*clientStream // client-initiated
-	nextStreamID     uint32
-	highestPromiseID uint32                    // highest promise id so far received from server
-	pendingRequests  int                       // requests blocked and waiting to be sent because len(streams) == maxConcurrentStreams
-	pings            map[[8]byte]chan struct{} // in flight ping data to notification channel
-	bw               *bufio.Writer
-	br               *bufio.Reader
-	fr               *Framer
-	lastActive       time.Time
-	lastIdle         time.Time // time last idle
+	mu                  sync.Mutex // guards following
+	cond                *sync.Cond // hold mu; broadcast on flow/closed changes
+	flow                flow       // our conn-level flow control quota (cs.flow is per stream)
+	inflow              flow       // peer's conn-level flow control
+	receiveStreamWindow uint32     // the initial receive window advertised in SETTINGS
+	receiveConnWindow   int32      // initial connection window plus our WINDOW_UPDATE
+	closing             bool
+	closed              bool
+	wantSettingsAck     bool                     // we sent a SETTINGS frame and haven't heard back
+	goAway              *GoAwayFrame             // if non-nil, the GoAwayFrame we received
+	goAwayDebug         string                   // goAway frame's debug data, retained as a string
+	streams             map[uint32]*clientStream // client-initiated
+	nextStreamID        uint32
+	highestPromiseID    uint32                    // highest promise id so far received from server
+	pendingRequests     int                       // requests blocked and waiting to be sent because len(streams) == maxConcurrentStreams
+	pings               map[[8]byte]chan struct{} // in flight ping data to notification channel
+	bw                  *bufio.Writer
+	br                  *bufio.Reader
+	fr                  *Framer
+	lastActive          time.Time
+	lastIdle            time.Time // time last idle
 	// Settings from peer: (also guarded by mu)
 	maxFrameSize          uint32
 	maxConcurrentStreams  uint32
@@ -765,6 +767,13 @@ func (t *Transport) newClientConn(c net.Conn, addr string, singleUse bool) (*Cli
 		}
 
 		cc.inflow.add(int32(inflowValue))
+		cc.receiveConnWindow = int32(inflowValue)
+		cc.receiveStreamWindow = initialWindowSize
+		for _, setting := range t.Settings {
+			if setting.ID == SettingInitialWindowSize {
+				cc.receiveStreamWindow = setting.Val
+			}
+		}
 		cc.nextStreamID = nextStreamId
 
 	} else {
@@ -805,6 +814,8 @@ func (t *Transport) newClientConn(c net.Conn, addr string, singleUse bool) (*Cli
 		cc.fr.WriteSettings(initialSettings...)
 		cc.fr.WriteWindowUpdate(0, transportDefaultConnFlow)
 		cc.inflow.add(transportDefaultConnFlow + initialWindowSize)
+		cc.receiveConnWindow = transportDefaultConnFlow + initialWindowSize
+		cc.receiveStreamWindow = t.InitialWindowSize
 	}
 
 	cc.bw.Flush()
@@ -852,10 +863,12 @@ func (fr *Framer) AutoWriteFrames(t *Transport) (inflowValue uint32, nextStreamI
 				nextStreamId = (p.StreamID + 1) | 1
 			}
 		}
-		if uint64(inflowValue)+uint64(h.ConnectionFlow) > 0xffffffff {
+		if uint64(initialWindowSize)+uint64(h.ConnectionFlow) > 0x7fffffff {
 			return 0, 0, errors.New("http2: explicit receive window overflow")
 		}
-		return inflowValue + uint32(h.ConnectionFlow), nextStreamId, nil
+		// SETTINGS_INITIAL_WINDOW_SIZE applies only to streams. A connection
+		// always starts with 65535 bytes before its WINDOW_UPDATE is applied.
+		return initialWindowSize + uint32(h.ConnectionFlow), nextStreamId, nil
 	}
 	if t.HTTP2Settings == nil {
 		return 0, 0, errors.New("HTTP2Settings is required when using AutoWriteFrames")
@@ -911,7 +924,10 @@ func (fr *Framer) AutoWriteFrames(t *Transport) (inflowValue uint32, nextStreamI
 		nextStreamId = uint32(1)
 	}
 
-	return inflowValue + connectionFlow, nextStreamId, nil
+	if uint64(initialWindowSize)+uint64(connectionFlow) > 0x7fffffff {
+		return 0, 0, errors.New("http2: connection receive window overflow")
+	}
+	return initialWindowSize + connectionFlow, nextStreamId, nil
 }
 
 func (cc *ClientConn) healthCheck() {
@@ -1983,7 +1999,7 @@ func (cc *ClientConn) newStreamWithID(streamID uint32, incNext bool) *clientStre
 	}
 	cs.flow.add(int32(cc.initialWindowSize))
 	cs.flow.setConnFlow(&cc.flow)
-	cs.inflow.add(transportDefaultStreamFlow)
+	cs.inflow.add(int32(cc.receiveStreamWindow))
 	cs.inflow.setConnFlow(&cc.inflow)
 	cc.streams[cs.ID] = cs
 
@@ -2421,17 +2437,19 @@ func (b transportResponseBody) Read(p []byte) (n int, err error) {
 
 	var connAdd, streamAdd int32
 	// Check the conn-level first, before the stream-level.
-	if v := cc.inflow.available(); v < transportDefaultConnFlow/2 {
-		connAdd = transportDefaultConnFlow - v
+	if v := cc.inflow.available(); v < cc.receiveConnWindow/2 {
+		connAdd = cc.receiveConnWindow - v
 		cc.inflow.add(connAdd)
 	}
 	if err == nil { // No need to refresh if the stream is over or failed.
 		// Consider any buffered body data (read from the conn but not
 		// consumed by the client) when computing flow control for this
 		// stream.
-		v := int(cs.inflow.available()) + cs.bufPipe.Len()
-		if v < transportDefaultStreamFlow-transportDefaultStreamMinRefresh {
-			streamAdd = int32(transportDefaultStreamFlow - v)
+		v := int64(cs.inflow.n) + int64(cs.bufPipe.Len())
+		target := int64(cc.receiveStreamWindow)
+		refresh := min(int64(transportDefaultStreamMinRefresh), target/2)
+		if v < target-refresh {
+			streamAdd = int32(target - v)
 			cs.inflow.add(streamAdd)
 		}
 	}
