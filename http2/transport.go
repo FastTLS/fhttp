@@ -334,14 +334,16 @@ type ClientConn struct {
 // clientStream is the state for a single HTTP/2 stream. One of these
 // is created for each Transport.RoundTrip call.
 type clientStream struct {
-	cc           *ClientConn
-	req          *http.Request
-	trace        *httptrace.ClientTrace // or nil
-	ID           uint32
-	resc         chan resAndError
-	bufPipe      pipe   // buffered pipe with the flow-controlled response payload
-	startedWrite bool   // started request body write; guarded by cc.mu
-	on100        func() // optional code to run if get a 100 continue response
+	reqBodyCloseOnce sync.Once
+	reqBodyCloseErr  error
+	cc               *ClientConn
+	req              *http.Request
+	trace            *httptrace.ClientTrace // or nil
+	ID               uint32
+	resc             chan resAndError
+	bufPipe          pipe   // buffered pipe with the flow-controlled response payload
+	startedWrite     bool   // started request body write; guarded by cc.mu
+	on100            func() // optional code to run if get a 100 continue response
 
 	flow        flow  // guarded by cc.mu
 	inflow      flow  // guarded by cc.mu
@@ -448,6 +450,18 @@ func (cs *clientStream) abortRequestBodyWrite(err error) {
 	cs.stopReqBody = err
 	cc.cond.Broadcast()
 	cc.mu.Unlock()
+	// Flow-control wakeups cannot unblock a producer waiting inside Body.Read.
+	// Close outside cc.mu: user Close methods may wait for that Read to finish.
+	cs.closeRequestBody()
+}
+
+func (cs *clientStream) closeRequestBody() error {
+	cs.reqBodyCloseOnce.Do(func() {
+		if cs.req.Body != nil {
+			cs.reqBodyCloseErr = cs.req.Body.Close()
+		}
+	})
+	return cs.reqBodyCloseErr
 }
 
 type stickyErrWriter struct {
@@ -1568,7 +1582,7 @@ var (
 	errReqBodyTooLong = errors.New("http2: request body larger than specified content length")
 )
 
-func (cs *clientStream) writeRequestBody(body io.Reader, bodyCloser io.Closer) (err error) {
+func (cs *clientStream) writeRequestBody(body io.Reader) (err error) {
 	cc := cs.cc
 	sentEnd := false // whether we sent the final DATA frame w/ END_STREAM
 	buf := cc.frameScratchBuffer()
@@ -1580,7 +1594,7 @@ func (cs *clientStream) writeRequestBody(body io.Reader, bodyCloser io.Closer) (
 		// Request.Body is closed by the Transport,
 		// and in multiple cases: server replies <=299 and >299
 		// while still writing request body
-		cerr := bodyCloser.Close()
+		cerr := cs.closeRequestBody()
 		if err == nil {
 			err = cerr
 		}
@@ -1594,6 +1608,15 @@ func (cs *clientStream) writeRequestBody(body io.Reader, bodyCloser io.Closer) (
 	var sawEOF bool
 	for !sawEOF {
 		n, err := body.Read(buf[:len(buf)-1])
+		cc.mu.Lock()
+		stopErr := cs.stopReqBody
+		cc.mu.Unlock()
+		if stopErr != nil {
+			if stopErr == errStopReqBodyWriteAndCancel {
+				cc.writeStreamReset(cs.ID, ErrCodeCancel, stopErr)
+			}
+			return stopErr
+		}
 		if hasContentLen {
 			remainLen -= int64(n)
 			if remainLen == 0 && err == nil {
@@ -2968,7 +2991,7 @@ func (t *Transport) getBodyWriterState(cs *clientStream, body io.Reader) (s body
 		cs.cc.mu.Lock()
 		cs.startedWrite = true
 		cs.cc.mu.Unlock()
-		resc <- cs.writeRequestBody(body, cs.req.Body)
+		resc <- cs.writeRequestBody(body)
 	}
 	s.delay = t.expectContinueTimeout()
 	if s.delay == 0 ||
