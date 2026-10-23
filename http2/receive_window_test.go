@@ -87,3 +87,40 @@ func TestReceiveWindowRefreshSmallAndLarge(t *testing.T) {
 		})
 	}
 }
+
+func TestReceiveWindowClosedStreamDataRefund(t *testing.T) {
+	var wire bytes.Buffer
+	cc := &ClientConn{nextStreamID: 3, receiveConnWindow: 65535, bw: bufio.NewWriter(&wire)}
+	cc.fr = NewFramer(cc.bw, nil)
+	cc.inflow.add(65535)
+	rl := &clientConnReadLoop{cc: cc}
+	for i := 0; i < 100; i++ {
+		frame := &DataFrame{FrameHeader: FrameHeader{valid: true, StreamID: 1, Length: 1024}, data: make([]byte, 1024)}
+		if err := rl.processData(frame); err != nil {
+			t.Fatal(err)
+		}
+		if got := cc.inflow.available(); got != 65535 {
+			t.Fatalf("cancelled DATA inflated connection credit after frame %d: got %d, want 65535", i, got)
+		}
+		update, err := NewFramer(nil, &wire).ReadFrame()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if f, ok := update.(*WindowUpdateFrame); !ok || f.StreamID != 0 || f.Increment != 1024 {
+			t.Fatalf("missing connection refund: %#v", update)
+		}
+	}
+}
+
+func TestReceiveWindowClosedStreamDataOverrun(t *testing.T) {
+	var wire bytes.Buffer
+	cc := &ClientConn{nextStreamID: 3, bw: bufio.NewWriter(&wire)}
+	cc.fr = NewFramer(cc.bw, nil)
+	frame := &DataFrame{FrameHeader: FrameHeader{valid: true, StreamID: 1, Length: 1}, data: []byte{0}}
+	if err := (&clientConnReadLoop{cc: cc}).processData(frame); err != ConnectionError(ErrCodeFlowControl) {
+		t.Fatalf("overrun on cancelled stream: %v", err)
+	}
+	if cc.inflow.available() != 0 || wire.Len() != 0 {
+		t.Fatal("invalid DATA created receive credit")
+	}
+}

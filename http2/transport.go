@@ -2557,7 +2557,14 @@ func (rl *clientConnReadLoop) processData(f *DataFrame) error {
 		// But at least return their flow control:
 		if f.Length > 0 {
 			cc.mu.Lock()
-			cc.inflow.add(int32(f.Length))
+			if cc.inflow.available() < int32(f.Length) {
+				cc.mu.Unlock()
+				return ConnectionError(ErrCodeFlowControl)
+			}
+			// This DATA was not charged to a live stream above. Refunding
+			// it on the wire leaves local connection credit unchanged.
+			// Adding it locally would inflate our window after cancellations
+			// and suppress the updates needed by subsequent live streams.
 			cc.mu.Unlock()
 
 			cc.wmu.Lock()
