@@ -1650,7 +1650,7 @@ func TestTransportChecksRequestHeaderListSize(t *testing.T) {
 		cc := &ClientConn{peerMaxHeaderListSize: 0xffffffffffffffff}
 		cc.henc = hpack.NewEncoder(&cc.hbuf)
 		cc.mu.Lock()
-		hdrs, err := cc.encodeHeaders(req, true, trailers, contentLen)
+		hdrs, err := cc.encodeHeaders(req, trailers, contentLen)
 		cc.mu.Unlock()
 		if err != nil {
 			t.Fatalf("headerListSizeForRequest: %v", err)
@@ -3215,7 +3215,7 @@ func TestTransportRequestPathPseudo(t *testing.T) {
 		cc := &ClientConn{peerMaxHeaderListSize: 0xffffffffffffffff}
 		cc.henc = hpack.NewEncoder(&cc.hbuf)
 		cc.mu.Lock()
-		hdrs, err := cc.encodeHeaders(tt.req, false, "", -1)
+		hdrs, err := cc.encodeHeaders(tt.req, "", -1)
 		cc.mu.Unlock()
 		var got result
 		hpackDec := hpack.NewDecoder(initialHeaderTableSize, func(f hpack.HeaderField) {

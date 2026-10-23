@@ -56,6 +56,8 @@ const (
 
 // custom http2 settings
 type HTTP2Settings struct {
+	// Explicit disables Navigator defaults, including for zero flow and empty frames.
+	Explicit       bool `json:"-"`
 	Settings       []Setting
 	ConnectionFlow int
 	HeaderPriority *PriorityParam
@@ -819,6 +821,42 @@ func (t *Transport) newClientConn(c net.Conn, addr string, singleUse bool) (*Cli
 // 现在使用默认的 golang 配置，可以通过 HTTP2Settings 覆盖
 
 func (fr *Framer) AutoWriteFrames(t *Transport) (inflowValue uint32, nextStreamId uint32, err error) {
+	if t.HTTP2Settings != nil && t.HTTP2Settings.Explicit {
+		h := t.HTTP2Settings
+		inflowValue, nextStreamId = 65535, 1
+		for _, s := range h.Settings {
+			if err := s.Valid(); err != nil {
+				return 0, 0, err
+			}
+			if s.ID == SettingInitialWindowSize {
+				inflowValue = s.Val
+			}
+		}
+		t.Settings = h.Settings
+		if err = fr.WriteSettings(h.Settings...); err != nil {
+			return 0, 0, err
+		}
+		if h.ConnectionFlow < 0 || uint64(h.ConnectionFlow) > 0x7fffffff {
+			return 0, 0, errors.New("http2: invalid explicit connection flow")
+		}
+		if h.ConnectionFlow > 0 {
+			if err = fr.WriteWindowUpdate(0, uint32(h.ConnectionFlow)); err != nil {
+				return 0, 0, err
+			}
+		}
+		for _, p := range h.PriorityFrames {
+			if err = fr.WritePriority(p.StreamID, p.PriorityParam); err != nil {
+				return 0, 0, err
+			}
+			if p.StreamID >= nextStreamId {
+				nextStreamId = (p.StreamID + 1) | 1
+			}
+		}
+		if uint64(inflowValue)+uint64(h.ConnectionFlow) > 0xffffffff {
+			return 0, 0, errors.New("http2: explicit receive window overflow")
+		}
+		return inflowValue + uint32(h.ConnectionFlow), nextStreamId, nil
+	}
 	if t.HTTP2Settings == nil {
 		return 0, 0, errors.New("HTTP2Settings is required when using AutoWriteFrames")
 	}
@@ -1824,7 +1862,7 @@ func (cc *ClientConn) encodeHeaders(req *http.Request, trailers string, contentL
 					kv.Values = kv.Values[:1]
 				}
 
-				if kv.Values[0] == "" {
+				if len(kv.Values) == 0 || kv.Values[0] == "" {
 					continue
 				}
 			}
